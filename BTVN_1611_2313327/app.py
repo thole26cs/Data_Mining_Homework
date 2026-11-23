@@ -21,6 +21,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.feature_selection import f_classif
 
 from core import data_gen as dg
+from core import dbscan as dbm
 from core import model as md
 from core import preprocess as pp
 
@@ -54,7 +55,7 @@ def debate(claim: str, rebuttal: str):
 # ============================================================ sidebar & data
 PAGES = ["0. Tổng quan", "1. Dữ liệu giả lập & mất cân bằng", "2. Tiền xử lý",
          "3. Chọn mẫu, thuộc tính & Grid Search CV", "4. K-Means k=3 & learnt.pkl",
-         "5. So sánh mô hình", "6. Đánh giá & độ tin cậy"]
+         "5. DBSCAN (bổ sung)", "6. So sánh mô hình", "7. Đánh giá & độ tin cậy"]
 
 with st.sidebar:
     st.title("🎓 Gom cụm giờ đi học")
@@ -132,8 +133,9 @@ def page_overview():
         ("Trích chọn thuộc tính cho mô hình gom cụm", "Trang 3"),
         ("Phản biện: vì sao CV tốt hơn Bootstrap (và khi nào không)", "Trang 3"),
         ("K-Means k = 3 (sớm / đúng giờ / trễ); lưu kết quả learnt.pkl", "Trang 4"),
-        ("So sánh mô hình khác; phản biện K-Means vs DBSCAN", "Trang 5"),
-        ("Đánh giá: mô hình học được gì, có đáng tin cậy không", "Trang 6"),
+        ("DBSCAN đầy đủ: chọn eps/minPts, Grid Search CV, phát hiện ngoại lai, learnt_dbscan.pkl", "Trang 5"),
+        ("So sánh mô hình khác; phản biện K-Means vs DBSCAN", "Trang 5, 6"),
+        ("Đánh giá: mô hình học được gì, có đáng tin cậy không", "Trang 7"),
     ], columns=["Yêu cầu", "Trang"]))
     st.markdown("#### Quy trình")
     st.graphviz_chart("""
@@ -203,7 +205,7 @@ def page_data():
            "vừa để **chọn mẫu phân tầng** và **chia fold** — không động đến nhãn ẩn.")
     debate("K-Means tự tìm được nhóm nhỏ.",
            "K-Means tối thiểu SSE nên có **“hiệu ứng đồng đều”**: hay chẻ nhóm lớn và nuốt nhóm nhỏ. "
-           "Nhóm thiểu số chỉ được tìm thấy nếu nó **tách biệt đủ rõ**, điều này sẽ được kiểm chứng ở trang 3 và 6.")
+           "Nhóm thiểu số chỉ được tìm thấy nếu nó **tách biệt đủ rõ**, điều này sẽ được kiểm chứng ở trang 3 và 7.")
 
     stage("proof", "**Báo cáo chất lượng dữ liệu thô** (đối chiếu với nhật ký lỗi đã chèn):")
     c1, c2 = st.columns([3, 2])
@@ -455,7 +457,7 @@ def page_grid():
            "4. **Độ chệch:** OOB thường **bi quan** (train ít điểm khác nhau); .632 bù bằng điểm resubstitution vốn **lạc quan** — "
            "sửa lỗi này bằng lỗi khác.\n\n"
            "**Nhưng công bằng mà nói:** Bootstrap rất tốt để đo **độ bất định / độ ổn định** (khoảng tin cậy, mô hình "
-           "có đổi khi dữ liệu đổi không) và khi dữ liệu **rất ít**. Vì vậy ở trang 6 ta dùng bootstrap đúng vai trò đó: "
+           "có đổi khi dữ liệu đổi không) và khi dữ liệu **rất ít**. Vì vậy ở trang 7 ta dùng bootstrap đúng vai trò đó: "
            "**CV để chọn mô hình, Bootstrap để đo độ tin cậy.**")
     stage("proof", "Thực nghiệm: lấy 8 cấu hình trải đều bảng xếp hạng, ước lượng điểm bằng K-fold CV, Bootstrap OOB, "
                    "Bootstrap .632, rồi so với điểm **test thật**. Ước lượng tốt = gần test, ít dao động, xếp hạng đúng, rẻ.")
@@ -601,6 +603,214 @@ def page_kmeans():
                "không chỉ tâm cụm — để dữ liệu mới đi qua đúng các bước giống lúc huấn luyện.")
 
 
+DB_LEARNT_PATH = Path(__file__).parent / "learnt_dbscan.pkl"
+st.session_state.setdefault("dbgrid", dbm.DB_GRID_DEFAULT)
+
+
+def db_gkey():
+    g = st.session_state.dbgrid
+    return CFG, tuple((k, tuple(v)) for k, v in g.items()), st.session_state.n_splits
+
+
+@st.cache_resource(show_spinner="Đang chạy Grid Search CV cho DBSCAN (≈30 giây cho lưới mặc định)…")
+def get_db_grid(dk):
+    cfg, grid, n_splits = dk
+    D_ = load_data(cfg)
+    return dbm.run_dbscan_grid(D_["Xtr"], D_["ytr"], D_["s_tr"], {k: list(v) for k, v in grid},
+                               n_splits=n_splits, seed=dict(cfg)["seed"])
+
+
+@st.cache_data(show_spinner=False)
+def db_kdist(cfg, features, scaler, min_samples):
+    D_ = load_data(cfg)
+    cleaner = pp.StudentCleaner().fit(D_["X"])
+    Z = md.SCALERS[scaler]().fit_transform(cleaner.transform(D_["X"])[md.FEATURE_SETS[features]])
+    knee, kdist = md.kdistance_eps(Z, min_samples)
+    return knee, kdist
+
+
+@st.cache_data(show_spinner="Đang phát hiện ngoại lai…")
+def outlier_cached(cfg, q):
+    D_ = load_data(cfg)
+    return dbm.outlier_detection(D_["X"], D_["y"], q)
+
+
+def db_label_names(est, labels):
+    return ["Nhiễu" if c == -1 else f"Cụm {c} → {VI[dg.GROUPS[est.cluster_to_group_[int(c)]]]}" for c in labels]
+
+
+def page_dbscan():
+    st.title("5. DBSCAN — gom cụm dựa trên mật độ")
+    X, y = D["X"], D["y"]
+    stage("idea", "DBSCAN không tìm *tâm cụm* mà tìm **vùng dày đặc**: một điểm là *core* nếu trong bán kính **eps** "
+                  "có ≥ **minPts** điểm; các core nối được với nhau tạo thành một cụm; điểm không thuộc vùng dày nào là "
+                  "**nhiễu**. Ưu điểm hấp dẫn: không cần chọn k, cụm hình dạng bất kỳ, tự loại nhiễu. "
+                  "Câu hỏi: những ưu điểm đó có giúp ích cho bài toán *sớm / đúng giờ / trễ* không?")
+    st.table(pd.DataFrame([
+        ("Core point", "≥ minPts điểm trong bán kính eps", "Nằm trong lõi của cụm"),
+        ("Border point", "< minPts láng giềng nhưng nằm trong eps của một core", "Rìa cụm"),
+        ("Noise (-1)", "Không phải core, không gần core nào", "Ngoại lai — không thuộc nhóm nào"),
+    ], columns=["Loại điểm", "Điều kiện", "Ý nghĩa"]))
+
+    stage("lead")
+    st.markdown("#### (a) Thử tay: eps và minPts thay đổi kết quả thế nào?")
+    st.caption("Cùng bộ làm sạch như K-Means, chạy trên toàn bộ dữ liệu. Gán nghĩa cụm **không dùng nhãn**: cụm có giờ "
+               "đến trung bình ≤ −5' là *sớm*, > 5' là *trễ*, còn lại *đúng giờ*. Điểm nhiễu bị tính là **sai** khi tính F1.")
+    c1, c2, c3, c4 = st.columns(4)
+    feat = c1.selectbox("Bộ thuộc tính", ["core", "behavior"], key="db_feat")
+    scal = c2.selectbox("Chuẩn hoá", ["standard", "robust"], key="db_scal")
+    ms = c3.slider("minPts", 3, 80, 2 * len(md.FEATURE_SETS[feat]), key=f"db_ms_{feat}")
+    knee, kdist = db_kdist(CFG, feat, scal, ms)
+    eps = c4.slider("eps", 0.05, 3.0, float(round(knee, 2)), 0.01, key=f"db_eps_{feat}_{scal}_{ms}")
+    est = dbm.SampledDBSCAN("random", 1.0, feat, scal, min_samples=ms, eps=eps, random_state=seed).fit(X)
+    sc = dbm.db_scorer(est, X, y)
+    m = st.columns(5)
+    m[0].metric("Số cụm", int(sc["N_clusters"]))
+    m[1].metric("% nhiễu", f"{sc['Noise_pct']:.1f}%")
+    m[2].metric("F1-macro", fmt(sc["F1_macro"]))
+    m[3].metric("Recall nhóm trễ", fmt(sc["Late_recall"]))
+    m[4].metric("ARI", fmt(sc["ARI"]))
+    c1, c2 = st.columns(2)
+    fig = px.line(y=kdist, labels={"x": "điểm (sắp xếp tăng dần)", "y": f"khoảng cách tới láng giềng thứ {ms}"},
+                  title="Đồ thị k-distance: khuỷu ≈ eps gợi ý")
+    fig.add_hline(y=knee, line_dash="dot", line_color="gray", annotation_text=f"khuỷu {knee:.2f}")
+    fig.add_hline(y=eps, line_dash="dash", line_color="red", annotation_text=f"eps đang chọn {eps:.2f}")
+    c1.plotly_chart(fig, use_container_width=True)
+    Xc = est.cleaner_.transform(X)
+    names = db_label_names(est, est.labels_)
+    cmap = {n: ("#9ca3af" if n == "Nhiễu" else COLORS[n.split("→ ")[1]]) for n in set(names)}
+    c2.plotly_chart(px.scatter(x=Xc["arrival_minutes"], y=Xc["wake_up_hour"], color=names, color_discrete_map=cmap,
+                               opacity=0.6, labels={"x": "arrival_minutes", "y": "wake_up_hour", "color": ""},
+                               title="Kết quả DBSCAN"), use_container_width=True)
+    st.caption("Thử: eps nhỏ → nhóm trễ (thưa) biến thành nhiễu xám; eps lớn → sớm/đúng giờ/trễ dính thành 1–2 cụm. "
+               "Rất khó tìm được một eps cho ra đúng 3 nhóm.")
+
+    st.markdown("#### (b) Grid Search CV cho DBSCAN (cùng Stratified K-fold như K-Means)")
+    st.markdown("`eps = eps_scale × eps khuỷu` (tính lại trên mỗi fold train) để eps so sánh được giữa các bộ thuộc tính. "
+                "Điểm của fold validation được gán theo **core point gần nhất trong bán kính eps**, xa hơn là nhiễu.")
+    g = st.session_state.dbgrid
+    with st.form("db_grid_form"):
+        c1, c2, c3 = st.columns(3)
+        s_feat = c1.multiselect("Bộ thuộc tính", list(md.FEATURE_SETS), g["features"])
+        s_scal = c1.multiselect("Chuẩn hoá", list(md.SCALERS), g["scaler"])
+        s_ms = c2.multiselect("minPts", [3, 5, 8, 10, 15, 20, 30, 40, 60], g["min_samples"])
+        s_es = c2.multiselect("eps_scale", [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0], g["eps_scale"])
+        s_samp = c3.multiselect("Cách chọn mẫu", list(md.SAMPLING_VI), g["sampling"])
+        s_frac = c3.multiselect("Tỉ lệ mẫu", [0.3, 0.6, 1.0], g["frac"])
+        n_cfg = max(1, len(s_feat) * len(s_scal) * len(s_ms) * len(s_es) * len(s_samp) * len(s_frac))
+        c3.caption(f"{n_cfg} cấu hình × {st.session_state.n_splits} fold")
+        if st.form_submit_button("▶️ Chạy Grid Search CV (DBSCAN)", type="primary"):
+            if not all([s_feat, s_scal, s_ms, s_es, s_samp, s_frac]):
+                st.error("Mỗi tham số cần ít nhất 1 giá trị.")
+            else:
+                st.session_state.dbgrid = {"features": s_feat, "scaler": s_scal, "min_samples": sorted(s_ms),
+                                           "eps_scale": sorted(s_es), "sampling": s_samp, "frac": sorted(s_frac)}
+                st.rerun()
+    dgs, db_elapsed = get_db_grid(db_gkey())
+    res = dbm.db_results_frame(dgs)
+    best = dgs.best_estimator_
+    st.success("**Cấu hình DBSCAN tốt nhất (theo F1-macro CV):** " +
+               ", ".join(f"`{k}` = **{v}**" for k, v in dgs.best_params_.items()) +
+               f" → eps = {best.eps_:.3f}, {best.n_clusters_} cụm trên train.")
+    cols = ["chosen", "features", "scaler", "min_samples", "eps_scale", "F1_macro", "F1_macro_std", "ARI",
+            "Late_recall", "Noise_pct", "N_clusters"]
+    st.dataframe(res.head(10)[cols].style.format({c: "{:.3f}" for c in cols[5:]}).apply(
+        lambda r: ["background-color:#dcfce7" if r["chosen"] else "" for _ in r], axis=1),
+        hide_index=True, use_container_width=True)
+    c1, c2, c3 = st.columns(3)
+    for col, metric, scale, title in [(c1, "F1_macro", "Greens", "F1-macro (max)"),
+                                      (c2, "N_clusters", "Blues", "Số cụm (TB)"),
+                                      (c3, "Noise_pct", "Reds", "% nhiễu (TB)")]:
+        agg = "max" if metric == "F1_macro" else "mean"
+        piv = res.groupby(["min_samples", "eps_scale"])[metric].agg(agg).unstack()
+        col.plotly_chart(px.imshow(piv, text_auto=".2f", color_continuous_scale=scale, aspect="auto",
+                                   title=f"{title}: minPts × eps_scale"), use_container_width=True)
+
+    stage("critique")
+    debate("DBSCAN không cần chọn k nên khách quan hơn K-Means.",
+           f"Không chọn k nhưng phải chọn **eps và minPts**, và kết quả **rất nhạy** với chúng: trong lưới trên, "
+           f"F1 dao động từ **{res['F1_macro'].min():.2f} đến {res['F1_macro'].max():.2f}**, số cụm từ "
+           f"**{res['N_clusters'].min():.0f} đến {res['N_clusters'].max():.0f}**. Đề lại yêu cầu **đúng 3 nhóm** — "
+           "với DBSCAN ta không ép được điều đó, chỉ có thể dò tham số và hy vọng.")
+    Zb = best.transform_features(X)
+    dd = dbm.density_by_group(Zb, [VI[g_] for g_ in y], k=best.min_samples)
+    med = dd.groupby("group")["kdist"].median()
+    ratio = med["Đi trễ"] / med["Đúng giờ"]
+    debate("DBSCAN chính xác hơn K-Means, chỉ là chậm hơn.",
+           f"DBSCAN giả định các cụm có **mật độ tương đương**. Ở đây khoảng cách tới láng giềng thứ {best.min_samples} "
+           f"(trung vị) của nhóm trễ lớn gấp **{ratio:.1f} lần** nhóm đúng giờ — nhóm trễ **thưa hơn nhiều**. Một eps duy nhất "
+           "không thể vừa đủ nhỏ để tách sớm/đúng giờ (vốn liền nhau), vừa đủ lớn để giữ nhóm trễ: hoặc nhóm trễ thành "
+           "nhiễu, hoặc mọi thứ dính vào nhau (xem biểu đồ bên dưới).")
+    fig = px.box(dd, x="group", y="kdist", color="group", color_discrete_map=COLORS, log_y=True, points=False,
+                 category_orders={"group": GROUP_ORDER},
+                 labels={"kdist": f"khoảng cách tới láng giềng thứ {best.min_samples} (log)", "group": ""},
+                 title="Mật độ cục bộ theo nhóm thật — đường đỏ là eps tốt nhất")
+    fig.add_hline(y=best.eps_, line_dash="dash", line_color="red")
+    st.plotly_chart(fig.update_layout(showlegend=False), use_container_width=True)
+    st.caption("Điểm có hộp nằm phía trên đường đỏ → phần lớn không đủ láng giềng trong eps → không phải core → dễ thành nhiễu.")
+
+    debate("DBSCAN chống nhiễu tốt nên luôn dùng được.",
+           "**Phần này đúng** — đây là thế mạnh thật của DBSCAN, nhưng ở vai trò **phát hiện ngoại lai** chứ không phải "
+           "gom 3 nhóm. Minh chứng: chạy DBSCAN trên **dữ liệu thô chưa làm sạch** và xem điểm nhiễu có trùng với các dòng "
+           "chứa giá trị vô lý/sai đơn vị không (ta biết chính xác vì tự chèn lỗi).")
+    q = st.slider("eps = phân vị của k-distance (tỉ lệ dữ liệu coi là 'bình thường')", 0.60, 0.98, 0.85, 0.01)
+    od, n_bad, t_od, knee_raw, eps_raw = outlier_cached(CFG, q)
+    st.dataframe(od.style.format({"Precision": "{:.3f}", "Recall": "{:.3f}"}), hide_index=True, use_container_width=True)
+    dbr, iqr = od.iloc[0], od.iloc[1]
+    st.markdown(
+        f"Có **{n_bad}** dòng thật sự chứa giá trị vô lý. DBSCAN: precision **{dbr['Precision']:.2f}**, recall "
+        f"**{dbr['Recall']:.2f}**, đánh dấu nhầm **{dbr['SV trễ hợp lệ bị đánh dấu nhầm']}** SV trễ hợp lệ. "
+        f"IQR×1.5: precision **{iqr['Precision']:.2f}**, recall **{iqr['Recall']:.2f}**, nhưng đánh dấu nhầm "
+        f"**{iqr['SV trễ hợp lệ bị đánh dấu nhầm']}** SV trễ hợp lệ — đúng vấn đề đã thấy ở trang 2. DBSCAN xét "
+        "**nhiều chiều cùng lúc** nên phân biệt được *\"đến trễ nhưng mọi thứ khác hợp lý\"* với *\"dữ liệu hỏng\"*.\n\n"
+        f"Lưu ý: ở đây **không** dùng điểm khuỷu ({knee_raw:.1f}) vì các giá trị cực đoan (999 phút…) kéo dài đuôi "
+        f"k-distance làm khuỷu lệch rất xa; dùng phân vị cho eps = {eps_raw:.2f}.")
+
+    stage("proof", "**Đối đầu trên tập test** — cả hai đều là cấu hình tốt nhất từ Grid Search CV của chính nó:")
+    kgs, k_elapsed = get_grid(gkey())
+    km = kgs.best_estimator_
+    Xte, yte = D["Xte"], D["yte"]
+    ks = {k: f(km, Xte, yte) for k, f in md.SCORERS.items()}
+    ds = dbm.db_scorer(best, Xte, yte)
+    h2h = pd.DataFrame([
+        {"Mô hình": "K-Means (k=3)", "F1_macro": ks["F1_macro"], "ARI": ks["ARI"], "Late_recall": ks["Late_recall"],
+         "% nhiễu": 0.0, "Số cụm": 3, "Thời gian Grid Search (s)": k_elapsed, "Thời gian 1 lần huấn luyện (s)": kgs.refit_time_},
+        {"Mô hình": "DBSCAN", "F1_macro": ds["F1_macro"], "ARI": ds["ARI"], "Late_recall": ds["Late_recall"],
+         "% nhiễu": ds["Noise_pct"], "Số cụm": int(ds["N_clusters"]), "Thời gian Grid Search (s)": db_elapsed,
+         "Thời gian 1 lần huấn luyện (s)": dgs.refit_time_},
+    ])
+    c1, c2 = st.columns([3, 2])
+    c1.dataframe(h2h.style.format({"F1_macro": "{:.3f}", "ARI": "{:.3f}", "Late_recall": "{:.3f}", "% nhiễu": "{:.1f}",
+                                   "Thời gian Grid Search (s)": "{:.1f}", "Thời gian 1 lần huấn luyện (s)": "{:.3f}"}),
+                 hide_index=True, use_container_width=True)
+    long = h2h.melt(id_vars="Mô hình", value_vars=["F1_macro", "ARI", "Late_recall"], var_name="Chỉ số", value_name="Giá trị")
+    c2.plotly_chart(px.bar(long, x="Chỉ số", y="Giá trị", color="Mô hình", barmode="group", text_auto=".2f",
+                           title="K-Means vs DBSCAN (test)"), use_container_width=True)
+    km_better = ks["F1_macro"] > ds["F1_macro"]
+    (st.success if km_better else st.warning)(
+        ("**Kết luận:** với bài toán 3 nhóm liền nhau, mật độ khác nhau, **K-Means tốt hơn rõ rệt** "
+         f"(F1 {ks['F1_macro']:.2f} vs {ds['F1_macro']:.2f}; recall nhóm trễ {ks['Late_recall']:.2f} vs {ds['Late_recall']:.2f}). "
+         "\"DBSCAN chính xác hơn\" **không đúng ở đây**."
+         if km_better else
+         f"**Kết luận:** trên cấu hình dữ liệu hiện tại DBSCAN đạt F1 {ds['F1_macro']:.2f} ≥ K-Means {ks['F1_macro']:.2f} — "
+         "hãy xem lại phần mật độ: có thể các nhóm đang tách biệt và đồng đều mật độ hơn.") +
+        "\n\n**Đề xuất kết hợp:** dùng **DBSCAN để phát hiện/loại dữ liệu hỏng** (thế mạnh của nó), rồi dùng "
+        "**K-Means để gom 3 nhóm** (đúng giả định của bài toán).")
+
+    st.markdown("#### 💾 Lưu `learnt_dbscan.pkl`")
+    payload = {"model": best, "best_params": dgs.best_params_, "eps": best.eps_, "n_clusters_train": best.n_clusters_,
+               "label_map": {int(c): (dg.GROUPS[g_] if g_ >= 0 else "noise") for c, g_ in best.cluster_to_group_.items()},
+               "features": best.features_, "test_metrics": ds, "data_config": dict(CFG)}
+    c1, c2 = st.columns([1, 2])
+    if c1.button("💾 Lưu learnt_dbscan.pkl"):
+        st.session_state["db_pkl_blob"] = md.save_learnt(DB_LEARNT_PATH, payload)
+        c1.success(f"Đã lưu {DB_LEARNT_PATH.name}")
+    if "db_pkl_blob" in st.session_state:
+        c1.download_button("⬇️ Tải learnt_dbscan.pkl", st.session_state["db_pkl_blob"], "learnt_dbscan.pkl")
+    c2.caption("Lưu cả pipeline (bộ làm sạch + scaler + core points + eps) để dự đoán điểm mới: "
+               "`learnt['model'].predict_group(df)` → 0 sớm / 1 đúng giờ / 2 trễ / -1 nhiễu.")
+
+
 @st.cache_resource(show_spinner="Đang chạy các thuật toán gom cụm…")
 def compare_cached(gk):
     gs, _ = get_grid(gk)
@@ -614,7 +824,7 @@ def scaling_cached(sizes, ratios, features, seed):
 
 
 def page_compare():
-    st.title("5. So sánh với các mô hình khác")
+    st.title("6. So sánh với các mô hình khác")
     gs, _ = get_grid(gkey())
     stage("idea", "K-Means không phải lựa chọn duy nhất. So sánh trên **cùng dữ liệu, cùng tiền xử lý, cùng bộ thuộc "
                   "tính** với: MiniBatch K-Means, Gaussian Mixture (GMM), Agglomerative (Ward), DBSCAN, HDBSCAN.")
@@ -696,7 +906,7 @@ def stability_cached(gk, B):
 
 
 def page_evaluate():
-    st.title("6. Đánh giá: mô hình học được gì và có đáng tin cậy không?")
+    st.title("7. Đánh giá: mô hình học được gì và có đáng tin cậy không?")
     gs, _ = get_grid(gkey())
     est = gs.best_estimator_
     Xte, yte = D["Xte"], D["yte"]
@@ -830,5 +1040,5 @@ def page_evaluate():
 
 {
     PAGES[0]: page_overview, PAGES[1]: page_data, PAGES[2]: page_preprocess, PAGES[3]: page_grid,
-    PAGES[4]: page_kmeans, PAGES[5]: page_compare, PAGES[6]: page_evaluate,
+    PAGES[4]: page_kmeans, PAGES[5]: page_dbscan, PAGES[6]: page_compare, PAGES[7]: page_evaluate,
 }[page]()

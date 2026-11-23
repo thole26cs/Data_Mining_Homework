@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .streamlit/secrets.toml
 # Generated at runtime by the app
-learnt.pkl
+learnt*.pkl
 # Lecture slides (not part of the submission)
 *.pptx
+/skills/
