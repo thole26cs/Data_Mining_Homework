@@ -22,6 +22,7 @@ from sklearn.feature_selection import f_classif
 
 from core import data_gen as dg
 from core import dbscan as dbm
+from core import handcalc as hc
 from core import model as md
 from core import preprocess as pp
 
@@ -53,7 +54,7 @@ def debate(claim: str, rebuttal: str):
 
 
 # ============================================================ sidebar & data
-PAGES = ["0. Tổng quan", "1. Dữ liệu giả lập & mất cân bằng", "2. Tiền xử lý",
+PAGES = ["0. Tổng quan", "1. Dữ liệu giả lập & mất cân bằng", "1b. Ví dụ giải tay (18 SV)", "2. Tiền xử lý",
          "3. Chọn mẫu, thuộc tính & Grid Search CV", "4. K-Means k=3 & learnt.pkl",
          "5. DBSCAN (bổ sung)", "6. So sánh mô hình", "7. Đánh giá & độ tin cậy"]
 
@@ -129,6 +130,7 @@ def page_overview():
     st.table(pd.DataFrame([
         ("Tạo dữ liệu giả lập mất cân bằng, chưa tiền xử lý (missing, noisy, outliers)", "Trang 1"),
         ("Làm rõ dữ liệu có mất cân bằng không; tiền xử lý gì và vì sao", "Trang 1, 2"),
+        ("Ví dụ giải tay 18 SV: IQR, median, z-score, K-Means từng vòng, DBSCAN, F1 — đối chiếu sklearn", "Trang 1b"),
         ("Chọn mẫu phản ánh đặc điểm bài toán bằng Grid Search Cross-Validation", "Trang 3"),
         ("Trích chọn thuộc tính cho mô hình gom cụm", "Trang 3"),
         ("Phản biện: vì sao CV tốt hơn Bootstrap (và khi nào không)", "Trang 3"),
@@ -218,6 +220,228 @@ def page_data():
     c1.plotly_chart(px.histogram(raw, x=col, nbins=80, title=f"Histogram {col} (thô)"), use_container_width=True)
     c2.plotly_chart(px.box(raw, y=col, points="outliers", title=f"Boxplot {col} (thô)"), use_container_width=True)
     st.caption("Histogram cho thấy các giá trị vô lý (vd 999 phút, -300 phút) kéo dãn trục — K-Means rất nhạy với chúng vì dùng trung bình.")
+
+
+def _num_row(values, label="giá trị"):
+    return pd.DataFrame([values], index=[label], columns=[f"[{i}]" for i in range(len(values))])
+
+
+def page_handcalc():
+    st.title("1b. Ví dụ giải tay — 18 sinh viên, 2 thuộc tính")
+    df = hc.tiny_dataset()
+    names = df["student_id"].tolist()
+    stage("idea", "Trước khi tin vào kết quả trên 2000 sinh viên, ta cần **hiểu thuật toán làm gì từng bước**. "
+                  "Trang này dùng **18 sinh viên** (5 sớm, 10 đúng giờ, 3 trễ — vẫn mất cân bằng) với **số tròn** để "
+                  "tính được trên giấy. Mỗi bước có bảng số để tự tính lại, và cuối trang **đối chiếu với sklearn** để "
+                  "chứng minh *tính tay = máy tính*.")
+    c1, c2 = st.columns([3, 2])
+    c1.dataframe(df.rename(columns={"_true_group": "_true_group (ẩn)"}), hide_index=True, use_container_width=True,
+                 height=665)
+    c2.markdown("**Ý nghĩa cột**\n- `arrival_minutes`: đến lớp sớm (−) / trễ (+) bao nhiêu phút\n"
+                "- `wake_up_hour`: giờ thức dậy (6.5 = 6h30)\n- `_true_group`: nhãn thật, **không** đưa vào mô hình\n\n"
+                "**Lỗi cố ý chèn:** E4 thiếu giờ dậy, O8 thiếu giờ đến, O9 dậy lúc *25h*, O10 đến trễ *999 phút*.")
+    c2.download_button("⬇️ Tải dữ liệu (CSV) để giải tay / Excel", df.to_csv(index=False).encode("utf-8-sig"),
+                       "vi_du_giai_tay_18SV.csv")
+
+    stage("lead")
+    # ---------------------------------------------------------------- bước 1
+    st.markdown("#### Bước 1 — Luật miền: giá trị vô lý → thiếu")
+    R, log = hc.apply_rules(df)
+    st.dataframe(log, hide_index=True, use_container_width=True)
+
+    # ---------------------------------------------------------------- bước 2
+    st.markdown("#### Bước 2 — Phát hiện ngoại lai bằng IQR (chỉ *phát hiện*, không xoá)")
+    q1 = hc.quantile_steps(R["arrival_minutes"], 0.25)
+    q3 = hc.quantile_steps(R["arrival_minutes"], 0.75)
+    st.markdown(f"Sắp xếp {len(q1['sorted'])} giá trị `arrival_minutes` hợp lệ (đánh số từ 0):")
+    st.dataframe(_num_row(q1["sorted"]), use_container_width=True)
+    iqr = q3["value"] - q1["value"]
+    lo_f, hi_f = q1["value"] - 1.5 * iqr, q3["value"] + 1.5 * iqr
+    st.latex(r"\text{vị trí } h = q\,(n-1),\quad Q = x_{\lfloor h\rfloor} + (h-\lfloor h\rfloor)\,(x_{\lfloor h\rfloor+1}-x_{\lfloor h\rfloor})")
+    st.markdown(
+        f"- **Q1**: h = 0.25 × {len(q1['sorted']) - 1} = {q1['h']:.2f} → Q1 = {q1['x_lo']:g} + {q1['frac']:.2f} × "
+        f"({q1['x_hi']:g} − ({q1['x_lo']:g})) = **{q1['value']:g}**\n"
+        f"- **Q3**: h = 0.75 × {len(q3['sorted']) - 1} = {q3['h']:.2f} → Q3 = {q3['x_lo']:g} + {q3['frac']:.2f} × "
+        f"({q3['x_hi']:g} − {q3['x_lo']:g}) = **{q3['value']:g}**\n"
+        f"- **IQR** = Q3 − Q1 = **{iqr:g}**; hàng rào = [Q1 − 1.5·IQR, Q3 + 1.5·IQR] = **[{lo_f:g}, {hi_f:g}]**")
+    flagged = R[(R["arrival_minutes"] < lo_f) | (R["arrival_minutes"] > hi_f)]
+    if len(flagged):
+        st.warning("IQR đánh dấu ngoại lai: " + ", ".join(
+            f"**{r['student_id']}** ({r['arrival_minutes']:g} phút, nhóm thật: {VI[r['_true_group']]})"
+            for _, r in flagged.iterrows())
+            + ". Đây là **sinh viên trễ thật**, không phải dữ liệu hỏng → xoá đi là xoá nhóm thiểu số. "
+              "Vì vậy chỉ dùng luật miền (bước 1) để loại giá trị vô lý.")
+
+    # ---------------------------------------------------------------- bước 3
+    st.markdown("#### Bước 3 — Điền khuyết bằng median")
+    F = R.copy()
+    for c in hc.FEATS:
+        m = hc.median_steps(R[c])
+        pos = " và ".join(f"[{p}]" for p in m["pos"])
+        vals = " và ".join(f"{m['sorted'][p]:g}" for p in m["pos"])
+        st.markdown(f"**{c}** — {m['n']} giá trị đã sắp xếp; n chẵn → median = trung bình phần tử {pos} = "
+                    f"({vals}) / {len(m['pos'])} = **{m['value']:g}**" if len(m["pos"]) == 2 else
+                    f"**{c}** — n lẻ → median = phần tử {pos} = **{m['value']:g}**")
+        st.dataframe(_num_row(m["sorted"]), use_container_width=True)
+        miss = F[c].isna()
+        F.loc[miss, c] = m["value"]
+        st.caption("Điền cho: " + ", ".join(f"{s} → {m['value']:g}" for s in F.loc[miss, "student_id"]))
+
+    # ---------------------------------------------------------------- bước 4
+    st.markdown("#### Bước 4 — Chuẩn hoá z-score")
+    Zdf, mu, sigma = hc.zscore(F)
+    st.latex(r"z = \frac{x-\mu}{\sigma},\qquad \mu=\frac{1}{n}\sum x_i,\qquad \sigma=\sqrt{\frac{1}{n}\sum (x_i-\mu)^2}")
+    st.markdown(" · ".join(
+        f"**{c}**: Σx = {F[c].sum():g}, μ = {F[c].sum():g}/18 = **{mu[c]:.4f}**, σ = **{sigma[c]:.4f}**" for c in hc.FEATS))
+    st.markdown("Không chuẩn hoá thì 1 phút (`arrival`) và 1 giờ (`wake_up`) được tính *ngang nhau* trong khoảng cách "
+                "Euclid — `arrival` (dao động ±20) sẽ lấn át hoàn toàn `wake_up` (dao động ±1).")
+    zt = pd.DataFrame({"SV": names, "arrival (x)": F["arrival_minutes"], "x − μ": F["arrival_minutes"] - mu.iloc[0],
+                       "z_arrival": Zdf["arrival_minutes"], "wake (x)": F["wake_up_hour"],
+                       "x − μ ": F["wake_up_hour"] - mu.iloc[1], "z_wake": Zdf["wake_up_hour"]})
+    st.dataframe(zt.style.format({c: "{:.3f}" for c in zt.columns[1:]}), hide_index=True, use_container_width=True)
+    Z = Zdf.to_numpy()
+
+    # ---------------------------------------------------------------- bước 5
+    st.markdown("#### Bước 5 — K-Means, k = 3, giải tay từng vòng lặp")
+    order = np.argsort(F["arrival_minutes"].to_numpy(), kind="stable")
+    init = [int(order[0]), int(order[len(order) // 2]), int(order[-1])]
+    st.markdown(f"**Khởi tạo** (quy tắc đơn giản, không ngẫu nhiên): C1 = SV đến sớm nhất (**{names[init[0]]}**), "
+                f"C2 = SV ở vị trí trung vị theo giờ đến (**{names[init[1]]}**), C3 = SV đến muộn nhất (**{names[init[2]]}**).")
+    st.latex(r"d(x, C_k)=\sqrt{(z_{arr}-C_{k,arr})^2+(z_{wake}-C_{k,wake})^2},\quad "
+             r"\text{gán } x \to \arg\min_k d,\quad C_k^{mới}=\text{trung bình các điểm trong cụm }k")
+    iters = hc.kmeans_manual(Z, init)
+    for it in iters:
+        title = (f"Vòng {it['iter']}: SSE = {it['sse']:.3f}" +
+                 ("" if it["changed"] is None else f" — {it['changed']} điểm đổi cụm") +
+                 (" ✅ hội tụ" if it["changed"] == 0 else ""))
+        with st.expander(title, expanded=it["iter"] == 1):
+            st.markdown("Tâm cụm dùng ở vòng này (không gian z):")
+            st.dataframe(pd.DataFrame(it["centroids"], index=["C1", "C2", "C3"], columns=["z_arrival", "z_wake"])
+                         .style.format("{:.3f}"), use_container_width=True)
+            t = pd.DataFrame(it["dist"], columns=["d(·,C1)", "d(·,C2)", "d(·,C3)"])
+            t.insert(0, "SV", names)
+            t["→ cụm"] = [f"C{k + 1}" for k in it["labels"]]
+            st.dataframe(t.style.format({c: "{:.3f}" for c in t.columns[1:4]}).highlight_min(
+                subset=["d(·,C1)", "d(·,C2)", "d(·,C3)"], axis=1, color="#bbf7d0"), hide_index=True, use_container_width=True)
+            newc = pd.DataFrame(it["new_centroids"], index=["C1", "C2", "C3"], columns=["z_arrival", "z_wake"])
+            newc["thành viên"] = [", ".join(np.array(names)[it["labels"] == k]) for k in range(3)]
+            st.markdown("Tâm mới = trung bình toạ độ các thành viên:")
+            st.dataframe(newc.style.format({"z_arrival": "{:.3f}", "z_wake": "{:.3f}"}), use_container_width=True)
+            fig = px.scatter(x=Z[:, 0], y=Z[:, 1], color=[f"C{k + 1}" for k in it["labels"]], text=names,
+                             labels={"x": "z_arrival", "y": "z_wake", "color": "cụm"})
+            fig.add_scatter(x=it["centroids"][:, 0], y=it["centroids"][:, 1], mode="markers", name="tâm (đầu vòng)",
+                            marker=dict(symbol="x", size=16, color="black"))
+            st.plotly_chart(fig.update_traces(textposition="top center", selector=dict(mode="markers+text")),
+                            use_container_width=True, key=f"hc_km_{it['iter']}")
+    final = iters[-1]
+    cent_orig = final["new_centroids"] * sigma.to_numpy() + mu.to_numpy()
+    rank = np.argsort(np.argsort(cent_orig[:, 0]))
+    km_group = np.array([rank[k] for k in final["labels"]])
+    st.markdown("**Gán nghĩa cụm** (không nhìn nhãn): đổi tâm về đơn vị gốc `C·σ + μ`, sắp theo giờ đến:")
+    st.dataframe(pd.DataFrame({"Cụm": ["C1", "C2", "C3"], "arrival (phút)": cent_orig[:, 0], "wake (giờ)": cent_orig[:, 1],
+                               "→ Nhóm": [GROUP_ORDER[r] for r in rank]}).style.format(
+        {"arrival (phút)": "{:.2f}", "wake (giờ)": "{:.2f}"}), hide_index=True, use_container_width=True)
+
+    # ---------------------------------------------------------------- bước 6
+    st.markdown("#### Bước 6 — Đánh giá bằng tay: ma trận nhầm lẫn và F1")
+    yt = md.y_codes(df["_true_group"])
+    cm = confusion_matrix(yt, km_group, labels=[0, 1, 2])
+    c1, c2 = st.columns([2, 3])
+    c1.dataframe(pd.DataFrame(cm, index=[f"Thật: {g}" for g in GROUP_ORDER], columns=[f"Đoán: {g}" for g in GROUP_ORDER]),
+                 use_container_width=True)
+    prf = []
+    for k, g in enumerate(GROUP_ORDER):
+        tp, fp, fn = cm[k, k], cm[:, k].sum() - cm[k, k], cm[k, :].sum() - cm[k, k]
+        p = tp / (tp + fp) if tp + fp else 0
+        r = tp / (tp + fn) if tp + fn else 0
+        f = 2 * p * r / (p + r) if p + r else 0
+        prf.append({"Nhóm": g, "Precision = TP/(TP+FP)": f"{tp}/{tp + fp} = {p:.3f}",
+                    "Recall = TP/(TP+FN)": f"{tp}/{tp + fn} = {r:.3f}", "F1 = 2PR/(P+R)": round(f, 3)})
+    prf = pd.DataFrame(prf)
+    c2.dataframe(prf, hide_index=True, use_container_width=True)
+    c2.markdown(f"**F1-macro** = trung bình 3 F1 = **{prf['F1 = 2PR/(P+R)'].mean():.3f}**")
+
+    # ---------------------------------------------------------------- bước 7
+    st.markdown("#### Bước 7 — DBSCAN giải tay")
+    c1, c2 = st.columns(2)
+    eps = c1.slider("eps (trên không gian z)", 0.30, 1.60, 0.60, 0.05, key="hc_eps")
+    mp = c2.slider("minPts (tính cả chính điểm đó)", 2, 6, 3, key="hc_mp")
+    Dm, nbrs, core, dlab, kind, trace = hc.dbscan_manual(Z, eps, mp)
+    st.markdown("**Ma trận khoảng cách Euclid** (ô ≤ eps là láng giềng):")
+    fig = px.imshow(np.where(Dm <= eps, Dm, np.nan), x=names, y=names, text_auto=".2f", color_continuous_scale="Greens_r",
+                    aspect="auto")
+    fig.update_traces(text=np.round(Dm, 2), texttemplate="%{text}")
+    st.plotly_chart(fig.update_layout(height=620, coloraxis_showscale=False), use_container_width=True, key="hc_dist")
+    nt = pd.DataFrame({"SV": names, "N(i) = láng giềng trong eps": [", ".join(np.array(names)[nb]) for nb in nbrs],
+                       "|N(i)|": [len(nb) for nb in nbrs], "Loại": kind,
+                       "Cụm": ["nhiễu" if l == -1 else f"D{l + 1}" for l in dlab]})
+    st.dataframe(nt, hide_index=True, use_container_width=True)
+    st.markdown("**Quá trình loang cụm:** " + ("; ".join(
+        f"D{c + 1}: bắt đầu từ core {names[o[0]]}, lần lượt thêm " + " → ".join(names[p] for p in o) for c, o in trace)
+        if trace else "không có core point nào → tất cả là nhiễu."))
+    Fa = F["arrival_minutes"].to_numpy()
+    sweep = []
+    for e in np.arange(0.4, 1.65, 0.1):
+        lab = hc.dbscan_manual(Z, e, mp)[3]
+        grp = np.array([dbm.rule_group(Fa[lab == l].mean()) if l != -1 else -1 for l in lab])
+        sweep.append({"eps": round(e, 1), "Số cụm": len(set(lab) - {-1}), "Số điểm nhiễu": int((lab == -1).sum()),
+                      "SV trễ bị coi là nhiễu": int(((lab == -1) & (yt == 2)).sum()),
+                      "F1-macro": f1_score(yt, grp, average="macro", labels=[0, 1, 2], zero_division=0)})
+    sweep = pd.DataFrame(sweep)
+    st.markdown(f"**Quét eps (minPts = {mp}):** có eps nào tách đúng 3 nhóm không?")
+    st.dataframe(sweep.style.format({"F1-macro": "{:.3f}"}), hide_index=True, use_container_width=True)
+    st.caption("eps nhỏ: 3 SV trễ (thưa) thành nhiễu, nhóm đúng giờ còn bị chẻ theo giờ dậy 6h00/6h30; eps lớn: sớm và đúng "
+               "giờ dính nhau; lớn nữa: tất cả thành 1 cụm. Đúng hiện tượng đã thấy ở trang 5 với 2000 SV.")
+
+    stage("critique")
+    rng_res = []
+    from sklearn.cluster import KMeans
+    for s in range(50):
+        lab = KMeans(3, init="random", n_init=1, random_state=s).fit_predict(Z)
+        cents = np.array([F["arrival_minutes"].to_numpy()[lab == k].mean() for k in range(3)])
+        rk = np.argsort(np.argsort(cents))
+        rng_res.append(f1_score(yt, rk[lab], average="macro", labels=[0, 1, 2], zero_division=0))
+    rng_res = np.array(rng_res)
+    from sklearn.model_selection import StratifiedKFold
+    folds = [int((yt[va] == 2).sum()) for _, va in StratifiedKFold(5, shuffle=True, random_state=0).split(Z, yt)]
+    debate("18 mẫu giải tay được, kết quả hoàn hảo → đủ để kết luận, không cần 2000 mẫu.",
+           f"Kết quả *hoàn hảo* một phần vì **ta tự thiết kế số đẹp và chọn tâm khởi tạo khéo**. Với khởi tạo **ngẫu nhiên** "
+           f"(50 lần), F1-macro chỉ đạt 1.0 ở **{(rng_res > 0.999).mean() * 100:.0f}%** số lần, thấp nhất **{rng_res.min():.2f}**. "
+           f"Trên 18 điểm, mỗi SV là **5,6%** dữ liệu; nhóm trễ chỉ 3 người, sai 1 người là recall nhóm trễ giảm 33%.")
+    debate("Thì chạy luôn Grid Search + Stratified 5-fold CV trên 18 mẫu này.",
+           f"Nhóm trễ có 3 người < 5 fold → sklearn cảnh báo, và số SV trễ trong từng fold validation là **{folds}** — "
+           "có fold **không có SV trễ nào**, nên không đo được recall nhóm trễ ở fold đó. Chọn mô hình trên dữ liệu như vậy "
+           "là chọn theo may rủi.")
+    st.info("**Vai trò của từng phần:** ví dụ 18 SV dùng để **hiểu và kiểm chứng thuật toán** (từng con số tính được bằng tay); "
+            "thực nghiệm 2000 SV dùng để **kết luận có độ tin cậy** (CV, bootstrap, so sánh mô hình).")
+
+    stage("proof", "**Đối chiếu tính tay với thư viện:**")
+    from sklearn.cluster import DBSCAN as SkDBSCAN
+    from sklearn.preprocessing import StandardScaler
+    km_sk = KMeans(3, init=Z[init], n_init=1).fit(Z)
+    checks = [
+        ("Q1, Q3 (bước 2)", f"{q1['value']:g}, {q3['value']:g}",
+         f"{R['arrival_minutes'].quantile(0.25):g}, {R['arrival_minutes'].quantile(0.75):g}",
+         np.isclose(q1["value"], R["arrival_minutes"].quantile(0.25)) and np.isclose(q3["value"], R["arrival_minutes"].quantile(0.75))),
+        ("Median (bước 3)", f"{hc.median_steps(R['arrival_minutes'])['value']:g}, {hc.median_steps(R['wake_up_hour'])['value']:g}",
+         f"{R['arrival_minutes'].median():g}, {R['wake_up_hour'].median():g}",
+         np.isclose(hc.median_steps(R["arrival_minutes"])["value"], R["arrival_minutes"].median())),
+        ("z-score (bước 4)", "18×2 giá trị", "StandardScaler", np.allclose(Z, StandardScaler().fit_transform(F[hc.FEATS]))),
+        ("K-Means nhãn cụm (bước 5)", str(final["labels"].tolist()), str(km_sk.labels_.tolist()),
+         (final["labels"] == km_sk.labels_).all()),
+        ("K-Means tâm cụm (bước 5)", np.round(final["new_centroids"], 3).tolist(), np.round(km_sk.cluster_centers_, 3).tolist(),
+         np.allclose(final["new_centroids"], km_sk.cluster_centers_)),
+        (f"DBSCAN nhãn (bước 7, eps={eps}, minPts={mp})", str(dlab.tolist()),
+         str(SkDBSCAN(eps=eps, min_samples=mp).fit_predict(Z).tolist()),
+         (dlab == SkDBSCAN(eps=eps, min_samples=mp).fit_predict(Z)).all()),
+    ]
+    ck = pd.DataFrame(checks, columns=["Bước", "Tính tay", "Thư viện (pandas/sklearn)", "Khớp"])
+    ck["Khớp"] = ck["Khớp"].map({True: "✅", False: "❌"})
+    ck["Tính tay"] = ck["Tính tay"].astype(str)
+    ck["Thư viện (pandas/sklearn)"] = ck["Thư viện (pandas/sklearn)"].astype(str)
+    st.dataframe(ck, hide_index=True, use_container_width=True)
+    st.caption("Khi tính trên giấy với 2–3 chữ số thập phân, các giá trị khoảng cách/tâm có thể lệch ở chữ số cuối do làm "
+               "tròn, nhưng phép gán cụm vẫn giống nhau.")
 
 
 def page_preprocess():
@@ -1039,6 +1263,6 @@ def page_evaluate():
 
 
 {
-    PAGES[0]: page_overview, PAGES[1]: page_data, PAGES[2]: page_preprocess, PAGES[3]: page_grid,
-    PAGES[4]: page_kmeans, PAGES[5]: page_dbscan, PAGES[6]: page_compare, PAGES[7]: page_evaluate,
+    PAGES[0]: page_overview, PAGES[1]: page_data, PAGES[2]: page_handcalc, PAGES[3]: page_preprocess,
+    PAGES[4]: page_grid, PAGES[5]: page_kmeans, PAGES[6]: page_dbscan, PAGES[7]: page_compare, PAGES[8]: page_evaluate,
 }[page]()
